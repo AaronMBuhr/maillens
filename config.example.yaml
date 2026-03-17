@@ -1,0 +1,87 @@
+# MailLens Configuration
+# =====================
+# Sensitive values (API keys, passwords) can be overridden via environment
+# variables using the convention: MAILLENS_<SECTION>_<KEY>
+# e.g., llm.anthropic.api_key -> MAILLENS_LLM_ANTHROPIC_API_KEY
+
+mail:
+  # Path to Thunderbird mail directory (inside the container).
+  # Map your host Thunderbird profile's Mail directory to this path
+  # via the MAILLENS_MAIL_DIR env var in docker-compose.
+  directory: /mail
+
+  # auto | mbox | maildir — auto will detect based on directory structure
+  format: auto
+
+database:
+  host: db
+  port: 5432
+  name: maillens
+  user: maillens
+  # Override with MAILLENS_DB_PASSWORD env var
+  password: maillens
+
+embeddings:
+  # Provider for generating embeddings. Currently only ollama is supported.
+  provider: ollama
+  model: nomic-embed-text
+  ollama_url: http://ollama:11434
+
+  # Max tokens per chunk when splitting long messages
+  chunk_size: 512
+
+  # Number of texts to embed in a single batch
+  batch_size: 64
+
+retrieval:
+  # Number of candidate messages to retrieve before sending to LLM
+  top_k: 15
+
+  # Minimum combined score (0.0 - 1.0) to include a result — kept low
+  # because the context-budget trimming is the real constraint.
+  similarity_threshold: 0.08
+
+  # Whether to include full thread context for retrieved messages
+  include_thread_context: true
+
+llm:
+  # Which provider section to use: anthropic | openai | gemini | ollama
+  active_provider: anthropic
+
+  anthropic:
+    # Override with MAILLENS_LLM_ANTHROPIC_API_KEY or MAILLENS_ANTHROPIC_API_KEY
+    api_key: ""
+    model: claude-sonnet-4-20250514
+    max_tokens: 8192
+    max_context_tokens: 180000
+    temperature: 0.2
+
+  openai:
+    # Override with MAILLENS_LLM_OPENAI_API_KEY or MAILLENS_OPENAI_API_KEY
+    api_key: ""
+    model: gpt-4o
+    max_tokens: 32768
+    max_context_tokens: 120000
+    temperature: 0.2
+
+  gemini:
+    # Override with MAILLENS_LLM_GEMINI_API_KEY or MAILLENS_GEMINI_API_KEY
+    api_key: ""
+    model: gemini-2.5-flash
+    max_tokens: 32768
+    max_context_tokens: 900000
+    temperature: 0.2
+
+  ollama:
+    url: http://ollama:11434
+    model: llama3
+    max_tokens: 4096
+    max_context_tokens: 6000
+    temperature: 0.2
+
+server:
+  host: 0.0.0.0
+  port: 8000
+
+  # Enable CORS for development (set to false in production)
+  cors_allow_all: true

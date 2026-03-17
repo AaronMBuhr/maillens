@@ -1,0 +1,54 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${MAILLENS_DB_NAME:-maillens}
+      POSTGRES_USER: ${MAILLENS_DB_USER:-maillens}
+      POSTGRES_PASSWORD: ${MAILLENS_DB_PASSWORD:-maillens}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${MAILLENS_DB_USER:-maillens}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    ports:
+      - "${MAILLENS_PORT:-8000}:8000"
+    volumes:
+      - ${MAILLENS_MAIL_DIR:-./_mail}:/mail:ro
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - MAILLENS_DB_PASSWORD=${MAILLENS_DB_PASSWORD:-maillens}
+      - MAILLENS_ANTHROPIC_API_KEY=${MAILLENS_ANTHROPIC_API_KEY:-}
+      - MAILLENS_OPENAI_API_KEY=${MAILLENS_OPENAI_API_KEY:-}
+      - MAILLENS_GEMINI_API_KEY=${MAILLENS_GEMINI_API_KEY:-}
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  ollama_models:
