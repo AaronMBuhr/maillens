@@ -199,6 +199,137 @@ Results are blended with configurable weights (40% vector, 60% keyword by defaul
 | LLM providers | Anthropic, OpenAI, Google Gemini, Ollama |
 | Deployment | Docker Compose (multi-stage build) |
 
+## Technical Details
+
+### Database Schema
+
+All models use PostgreSQL with the pgvector extension. Embeddings are 768-dimensional vectors (matching nomic-embed-text output).
+
+**Message** -- one row per email:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | Integer PK | Auto-increment |
+| `message_id` | String | Unique, indexed. From the `Message-ID` header, or a SHA-256 hash of `(subject, date, sender, source_file, raw_snippet)` for messages without one |
+| `in_reply_to` | String | Indexed, used for thread reconstruction |
+| `references` | Text | Space-separated reference chain |
+| `thread_id` | Integer FK | Links to `threads.id` |
+| `subject`, `sender`, `recipients_to`, `recipients_cc` | Text/String | `sender` and `folder` are indexed |
+| `date` | DateTime(tz) | Timezone-aware UTC; descending index for sort performance |
+| `account` | String | Derived from Thunderbird directory structure (e.g., `imap.gmail.com`) |
+| `body_text`, `body_html`, `body_clean` | Text | Raw text, raw HTML, and cleaned (reply-stripped) versions |
+| `embedding` | Vector(768) | HNSW index with `m=16`, `ef_construction=64`, cosine ops |
+| `has_attachments` | Boolean | |
+| `ingested_at` | DateTime(tz) | Server-side default |
+
+**MessageChunk** -- one row per chunk of a long message:
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | Integer PK | |
+| `message_id` | Integer FK | Cascading delete; part of unique index with `chunk_index` |
+| `chunk_index` | Integer | Ordering within the parent message |
+| `chunk_text` | Text | The chunk content |
+| `embedding` | Vector(768) | HNSW index, same params as Message |
+
+**Thread** -- groups related messages:
+
+| Column | Type |
+|---|---|
+| `id` | Integer PK |
+| `subject` | Text |
+| `first_date`, `last_date` | DateTime |
+| `message_count` | Integer |
+
+### Ingestion Pipeline Details
+
+**Source discovery** (`discover_mail_sources`): Recursively scans the mounted profile directory. Files without extensions (and not `.msf` summary files) are treated as mbox. Directories containing `cur/` or `new/` subdirectories are treated as Maildir. Account names are derived from the Thunderbird folder hierarchy -- `ImapMail/<server>/...` yields the server name, `Mail/<account>/...` yields the account name.
+
+**Parsing robustness**: A `_sanitize` helper strips null bytes (`\x00`) that cause PostgreSQL encoding errors. A `_safe_charset` helper falls back to UTF-8 for unrecognized charset headers. Dates are always normalized to timezone-aware UTC.
+
+**Deduplication**: A `seen_in_run` set tracks message IDs within a single ingestion run. Combined with a database existence check, this prevents duplicates when the same email appears in multiple Thunderbird folders. On flush errors, the session is rolled back, the batch is cleared, and processing continues.
+
+**Thread building**: After all messages are ingested, threads are reconstructed by following `In-Reply-To` and `References` headers. The `message_id IN (...)` query is batched into groups of 30,000 to stay within asyncpg's 32,767 parameter limit.
+
+**Chunking**: Long messages are split with `chunk_text(text, chunk_size=512, overlap=64)`. Token counts are approximated at 0.75 words per token. Overlap ensures context isn't lost at chunk boundaries. Each chunk is embedded independently; the message-level embedding is the element-wise mean of all non-zero chunk embeddings.
+
+### Hybrid Search Details
+
+The search runs two independent SQL queries and merges results:
+
+**Vector path** -- A subquery finds the best chunk-level cosine similarity per message (`func.max(1 - cosine_distance)`), falling back to the message-level embedding via `coalesce`. Fetches `top_k * 3` candidates ordered by similarity.
+
+**Keyword path** -- Extracts keywords from the query by tokenizing with `[a-zA-Z0-9]+`, lowercasing, and filtering against a ~90-word stop list (pronouns, articles, common query verbs like "find"/"show"/"summarize", and email-related terms). For each keyword, builds an `or_(sender.ilike, subject.ilike, recipients_to.ilike)` condition. A SQL `case` expression counts how many keywords each message matches:
+
+```sql
+-- Pseudocode for the generated SQL
+SELECT messages.*, (
+    CASE WHEN (sender ILIKE '%kw1%' OR subject ILIKE '%kw1%' OR ...) THEN 1 ELSE 0 END +
+    CASE WHEN (sender ILIKE '%kw2%' OR subject ILIKE '%kw2%' OR ...) THEN 1 ELSE 0 END
+) AS kw_hits
+FROM messages
+WHERE (any keyword matches)
+ORDER BY kw_hits DESC, date DESC
+LIMIT top_k * 5
+```
+
+**Merge and rank** -- Candidates from both paths are combined into a single dict keyed by message ID. Each gets a blended score:
+
+```
+combined = 0.4 * vector_similarity + 0.6 * keyword_hit_ratio
+```
+
+where `keyword_hit_ratio = matched_keywords / total_keywords`. Results below the absolute threshold (default 0.08) are dropped. Then a **relative cutoff** removes results scoring below 40% of the best match -- this prevents low-relevance results from filling the context when only a few emails are truly relevant.
+
+### Context Budget Pipeline
+
+The query endpoint manages context size through a multi-stage pipeline:
+
+1. **Budget calculation** (`_compute_context_budget`): `available_tokens = max_context_tokens - max_output_tokens - system_prompt_tokens - question_tokens - history_tokens`. Tokens are estimated at ~4 characters each. The result is converted to a character budget.
+
+2. **Adaptive top_k** (`_estimate_top_k`): `k = char_budget / 2000` (estimated average chars per truncated message), clamped to `[10, 500]`.
+
+3. **Hybrid search**: Fetches up to `top_k` ranked results.
+
+4. **Thread expansion**: For the top 10 results that have a `thread_id`, sibling messages are fetched and appended (without displacing existing results).
+
+5. **Budget trimming** (`_trim_to_budget`): Computes a per-message body cap: `min(8000, (budget - n * 200) / n)` with a floor of 500 chars. Then greedily fills the budget in rank order, truncating each body to the cap. This ensures that a few long email threads don't monopolize the budget -- with Gemini's 900K context, this typically fits 400-500 messages at ~7K chars each.
+
+### LLM Provider Interface
+
+All providers extend `LLMProvider` and implement `complete()` and `stream()`. The base class provides:
+
+- `_format_context(messages, max_context_chars)` -- Formats emails as numbered `[Email N]` blocks with headers (From, To, Date, Subject, Folder) and body text, distributing the character budget across messages. This is what the LLM sees.
+- `_context_char_budget(system_prompt, user_message, history)` -- Estimates remaining char budget after accounting for non-context tokens.
+
+Each provider builds its message array differently:
+
+| Provider | System prompt | History format | Context location |
+|---|---|---|---|
+| **Anthropic** | `system=` parameter | Alternating user/assistant messages | Prepended to the final user message |
+| **OpenAI** | `{"role": "system"}` message | Interleaved in messages array | Prepended to the final user message |
+| **Gemini** | `system_instruction` in config | `types.Content(role="user"\|"model")` | Prepended to the final user Content |
+| **Ollama** | `{"role": "system"}` message | Interleaved in messages array | Prepended to the final user message |
+
+### Streaming Response Protocol
+
+The query endpoint uses Server-Sent Events (SSE) with four event types:
+
+| Event | Payload | When |
+|---|---|---|
+| `sources` | `{type: "sources", sources: [...]}` | After retrieval, before LLM call. Each source includes sender, date, subject, account, similarity score, and a 200-char snippet. |
+| `meta` | `{type: "meta", embed_time_ms, retrieval_time_ms, context_messages, context_budget_tokens}` | After retrieval. Reports timing and how many emails were sent to the LLM. |
+| `text` | `{type: "text", content: "..."}` | As LLM tokens stream in. Each chunk is a partial text fragment. |
+| `done` | `{type: "done"}` | Stream complete. |
+
+The frontend parses these via `ReadableStream` and updates the UI progressively -- source cards and a status message ("Searching emails...", "Sending N emails to LLM...") appear before the LLM's response starts streaming in.
+
+### Frontend State Management
+
+**ChatPage**: Maintains a `messages` array of `{role, content, sources, status}` objects. On submit, the full conversation history (minus the current question) is serialized as `conversation_history` in the API request, enabling multi-turn conversations. A "New conversation" button clears the array.
+
+**InboxPage**: Server-side sorting (`sort_by`, `sort_dir` query params) and pagination (`page`, `per_page`). The backend applies `ORDER BY` with a secondary sort on date. The frontend provides page input, first/last page, and +/-10 page jump buttons.
+
 ## Development
 
 ### Backend
@@ -233,6 +364,10 @@ Config-only changes (`config.yaml`) are volume-mounted and take effect with just
 ```bash
 docker compose restart app
 ```
+
+## Tested With
+
+Developed and tested against a Thunderbird profile with 4 email accounts, ~66,000 messages spanning 10+ years.
 
 ## License
 
