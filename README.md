@@ -97,13 +97,19 @@ First startup takes a few minutes while it pulls the embedding model. If `active
 |---|---|
 | Linux | `~/.thunderbird/<profile>/` |
 | macOS | `~/Library/Thunderbird/Profiles/<profile>/` |
-| Windows | `%APPDATA%\Thunderbird\Profiles\<profile>\` |
+| Windows | `C:\Users\<you>\AppData\Roaming\Thunderbird\Profiles\<profile>` |
 
-To find your profile name, check Thunderbird's **Help > Troubleshooting Information > Profile Directory**, or look in `~/.thunderbird/profiles.ini`.
+To find your profile name, open Thunderbird and go to **Help > Troubleshooting Information > Profile Directory** (or **About > Troubleshooting Information**). The path shown is your profile directory. On Linux/macOS you can also check `~/.thunderbird/profiles.ini`.
 
 Point `MAILLENS_MAIL_DIR` to the profile directory itself -- MailLens will discover all `Mail/` and `ImapMail/` subdirectories automatically and derive account names from the folder structure.
 
-> **Windows + WSL note**: If Docker runs in WSL, use the WSL mount path (e.g., `/mnt/c/Users/you/AppData/Roaming/Thunderbird/Profiles/...`).
+> **Windows + Docker Desktop (WSL backend)**: Docker Desktop runs inside WSL, so Windows paths must be converted to WSL mount paths. Replace `C:\Users\you\AppData\Roaming\...` with `/mnt/c/Users/you/AppData/Roaming/...` in your `.env` file. For example:
+>
+> ```
+> # Windows path:  C:\Users\aaron\AppData\Roaming\Thunderbird\Profiles\abc123.default-release
+> # .env setting:
+> MAILLENS_MAIL_DIR=/mnt/c/Users/aaron/AppData/Roaming/Thunderbird/Profiles/abc123.default-release
+> ```
 
 ## GPU Acceleration (Optional)
 
