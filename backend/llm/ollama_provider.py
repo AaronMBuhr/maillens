@@ -2,6 +2,7 @@
 Ollama local LLM provider.
 """
 
+import json
 from typing import AsyncGenerator, Optional
 
 import httpx
@@ -9,12 +10,15 @@ import httpx
 from backend.config import get_config
 from backend.llm.base import LLMProvider
 
+OLLAMA_TIMEOUT = 300
+
 
 class OllamaProvider(LLMProvider):
     def __init__(self):
         config = get_config()
         self.url = config.llm.ollama.url
         self.model = config.llm.ollama.model
+        self.max_tokens = config.llm.ollama.max_tokens
         self.max_context_tokens = config.llm.ollama.max_context_tokens
         self.temperature = config.llm.ollama.temperature
 
@@ -50,13 +54,16 @@ class OllamaProvider(LLMProvider):
         context = self._format_context(context_messages, max_context_chars=budget)
         msgs = self._build_messages(system_prompt, context, user_message, conversation_history)
 
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
             resp = await client.post(
                 f"{self.url}/api/chat",
                 json={
                     "model": self.model,
                     "stream": False,
-                    "options": {"temperature": self.temperature},
+                    "options": {
+                        "temperature": self.temperature,
+                        "num_ctx": self.max_context_tokens,
+                    },
                     "messages": msgs,
                 },
             )
@@ -75,25 +82,32 @@ class OllamaProvider(LLMProvider):
         context = self._format_context(context_messages, max_context_chars=budget)
         msgs = self._build_messages(system_prompt, context, user_message, conversation_history)
 
-        async with httpx.AsyncClient(timeout=120) as client:
-            async with client.stream(
-                "POST",
-                f"{self.url}/api/chat",
-                json={
-                    "model": self.model,
-                    "stream": True,
-                    "options": {"temperature": self.temperature},
-                    "messages": msgs,
-                },
-            ) as resp:
-                import json
+        print(f"[ollama] sending {len(context):,} chars context to {self.model}")
 
-                async for line in resp.aiter_lines():
-                    if line:
-                        try:
-                            data = json.loads(line)
-                            content = data.get("message", {}).get("content", "")
-                            if content:
-                                yield content
-                        except json.JSONDecodeError:
-                            continue
+        try:
+            async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.url}/api/chat",
+                    json={
+                        "model": self.model,
+                        "stream": True,
+                        "options": {
+                            "temperature": self.temperature,
+                            "num_ctx": self.max_context_tokens,
+                        },
+                        "messages": msgs,
+                    },
+                ) as resp:
+                    async for line in resp.aiter_lines():
+                        if line:
+                            try:
+                                data = json.loads(line)
+                                content = data.get("message", {}).get("content", "")
+                                if content:
+                                    yield content
+                            except json.JSONDecodeError:
+                                continue
+        except Exception as e:
+            print(f"[ollama] stream error: {type(e).__name__}: {e}")
+            yield f"\n\n[Error from Ollama: {e}]"

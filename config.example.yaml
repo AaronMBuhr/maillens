@@ -74,9 +74,9 @@ llm:
 
   ollama:
     url: http://ollama:11434
-    model: llama3
+    model: llama3.2:3b
     max_tokens: 4096
-    max_context_tokens: 6000
+    max_context_tokens: 8000
     temperature: 0.2
 
 server:

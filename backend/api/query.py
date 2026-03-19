@@ -15,7 +15,7 @@ from backend.config import get_config
 from backend.ingestion.embedder import embed_texts
 from backend.llm.factory import SYSTEM_PROMPT, get_active_provider_config, get_llm_provider
 from backend.storage.db import get_session
-from backend.storage.queries import get_thread_context, hybrid_search
+from backend.storage.queries import extract_search_keywords, get_thread_context, hybrid_search
 
 router = APIRouter()
 
@@ -113,34 +113,27 @@ def _trim_to_budget(results: list[dict], char_budget: int) -> list[dict]:
     return kept
 
 
-@router.post("/")
-async def query_email(
+async def _run_search_pipeline(
     request: QueryRequest,
-    session: AsyncSession = Depends(get_session),
+    session: AsyncSession,
 ):
-    """
-    Query the email archive with natural language.
-
-    Embeds the question, retrieves relevant messages via hybrid search,
-    fills context greedily by rank until the provider's token budget
-    is reached, and sends them to the configured LLM for analysis.
-    """
+    """Run keyword extraction, embedding, hybrid search, thread expansion, and trim."""
     config = get_config()
     provider_config = get_active_provider_config()
     history = [t.model_dump() for t in request.conversation_history] if request.conversation_history else None
+    provider = get_llm_provider()
 
     char_budget = _compute_context_budget(provider_config, SYSTEM_PROMPT, request.question, history)
     adaptive_k = _estimate_top_k(char_budget)
     top_k = request.top_k or adaptive_k
     print(f"[query] budget={char_budget} chars ({char_budget // CHARS_PER_TOKEN} tokens), top_k={top_k}")
 
-    # Step 1: Embed the query
     t0 = time.time()
+    keywords = await extract_search_keywords(request.question, provider)
     query_embeddings = await embed_texts([request.question])
     query_embedding = query_embeddings[0]
     embed_time = (time.time() - t0) * 1000
 
-    # Step 2: Retrieve candidate messages (over-fetch, then trim)
     t0 = time.time()
     candidates = await hybrid_search(
         session=session,
@@ -154,9 +147,9 @@ async def query_email(
         folder=request.folder,
         has_attachments=request.has_attachments,
         accounts=request.accounts,
+        keywords=keywords,
     )
 
-    # Expand thread context for top results (keep all candidates)
     if config.retrieval.include_thread_context:
         seen_ids = {m["message_id"] for m in candidates}
         extra = []
@@ -173,13 +166,10 @@ async def query_email(
 
     print(f"[query] hybrid search returned {len(candidates)} candidates")
 
-    # Trim to fit the provider's context budget
     results = _trim_to_budget(candidates, char_budget)
     print(f"[query] after budget trim: {len(results)} messages (budget={char_budget} chars)")
-
     retrieval_time = (time.time() - t0) * 1000
 
-    # Build source citations
     sources = [
         {
             "id": msg.get("id"),
@@ -195,12 +185,44 @@ async def query_email(
         for msg in results
     ]
 
-    # Step 3: Send to LLM
-    provider = get_llm_provider()
+    return {
+        "provider": provider,
+        "history": history,
+        "results": results,
+        "sources": sources,
+        "embed_time": embed_time,
+        "retrieval_time": retrieval_time,
+        "char_budget": char_budget,
+    }
+
+
+@router.post("/")
+async def query_email(
+    request: QueryRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Query the email archive with natural language.
+
+    Embeds the question, retrieves relevant messages via hybrid search,
+    fills context greedily by rank until the provider's token budget
+    is reached, and sends them to the configured LLM for analysis.
+    """
 
     if request.stream:
         async def stream_response():
             import json
+
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Extracting keywords...'})}\n\n"
+
+            pipeline = await _run_search_pipeline(request, session)
+            provider = pipeline["provider"]
+            history = pipeline["history"]
+            results = pipeline["results"]
+            sources = pipeline["sources"]
+            embed_time = pipeline["embed_time"]
+            retrieval_time = pipeline["retrieval_time"]
+            char_budget = pipeline["char_budget"]
 
             yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
             yield f"data: {json.dumps({'type': 'meta', 'embed_time_ms': embed_time, 'retrieval_time_ms': retrieval_time, 'context_messages': len(results), 'context_budget_tokens': char_budget // CHARS_PER_TOKEN})}\n\n"
@@ -229,6 +251,14 @@ async def query_email(
         )
 
     # Non-streaming response
+    pipeline = await _run_search_pipeline(request, session)
+    provider = pipeline["provider"]
+    history = pipeline["history"]
+    results = pipeline["results"]
+    sources = pipeline["sources"]
+    embed_time = pipeline["embed_time"]
+    retrieval_time = pipeline["retrieval_time"]
+
     t0 = time.time()
     answer = await provider.complete(
         system_prompt=SYSTEM_PROMPT,

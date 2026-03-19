@@ -202,6 +202,33 @@ html, body, #root {
   word-wrap: break-word;
 }
 
+.chat-sources-pane {
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  max-height: 180px;
+  min-height: 0;
+  flex-shrink: 0;
+}
+
+.chat-sources-header {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 8px 0 4px;
+  flex-shrink: 0;
+}
+
+.chat-sources-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  overflow-y: auto;
+  padding-bottom: 8px;
+}
+
 .message-sources {
   display: flex;
   flex-wrap: wrap;

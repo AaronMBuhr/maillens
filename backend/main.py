@@ -20,7 +20,7 @@ from backend.api.messages import router as messages_router
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     config = get_config()
-    print("MailLens build 0.05")
+    print("MailLens build 0.14")
     print(f"LLM provider: {config.llm.active_provider}")
     yield
     print("MailLens shutting down.")

@@ -18,6 +18,16 @@ from sqlalchemy import case, literal, select, and_, or_, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.storage.models import Message, MessageChunk, Thread
 
+_KEYWORD_EXTRACT_PROMPT = (
+    "You are a keyword extractor for an email search engine. "
+    "Given a user's query, output ONLY the search-worthy terms that should be "
+    "matched against email senders, recipients, and subjects. This means proper "
+    "nouns (people's names, company names), domain names, and specific phrases. "
+    "Omit generic/instruction words like 'summarize', 'find', 'common', 'topic', etc. "
+    "Output one keyword per line, lowercase. If there are no search-worthy terms, "
+    "output the single word: NONE"
+)
+
 _STOP_WORDS = frozenset({
     "i", "me", "my", "we", "our", "you", "your", "he", "she", "it", "its",
     "they", "them", "their", "this", "that", "these", "those",
@@ -40,15 +50,57 @@ _STOP_WORDS = frozenset({
     "many", "much", "lot", "lots", "every", "always", "never",
     "want", "need", "know", "think", "like", "please", "thanks",
     "been", "going", "went", "come", "came", "talk", "talked",
+    "common", "topic", "topics", "frequent", "frequently", "often",
+    "usual", "usually", "typical", "typically", "mainly", "mostly",
+    "related", "regarding", "concerning", "involved", "involve",
+    "subject", "subjects", "theme", "themes", "content", "contents",
+    "important", "interesting", "specific", "general", "overall",
+    "first", "last", "latest", "earliest", "oldest", "newest",
+    "sent", "received", "wrote", "written", "replied", "reply",
 })
 
 VECTOR_WEIGHT = 0.4
 KEYWORD_WEIGHT = 0.6
 
 
-def _extract_keywords(text: str) -> list[str]:
+def _extract_keywords_static(text: str) -> list[str]:
+    """Fallback: regex tokenization with static stop-word removal."""
     words = re.findall(r"[a-zA-Z0-9]+", text.lower())
     return [w for w in words if w not in _STOP_WORDS and len(w) > 1]
+
+
+async def extract_search_keywords(query: str, llm_provider) -> list[str]:
+    """Use the active LLM to extract search-worthy keywords from the query.
+
+    Falls back to static stop-word extraction on any failure.
+    """
+    try:
+        response = await llm_provider.complete(
+            system_prompt=_KEYWORD_EXTRACT_PROMPT,
+            user_message=query,
+            context_messages=[],
+        )
+        lines = [ln.strip().lower() for ln in response.strip().splitlines() if ln.strip()]
+        if lines == ["none"] or not lines:
+            print(f"[keywords] LLM returned no keywords, falling back to static")
+            return _extract_keywords_static(query)
+        raw = [re.sub(r"^[^a-z0-9]+|[^a-z0-9]+$", "", ln) for ln in lines]
+        words: list[str] = []
+        for phrase in raw:
+            for w in phrase.split():
+                cleaned = re.sub(r"[^a-z0-9]", "", w)
+                if cleaned and len(cleaned) > 1 and cleaned not in _STOP_WORDS:
+                    words.append(cleaned)
+        unique = [w for w in dict.fromkeys(words) if w != "none"]
+        keywords = [
+            kw for kw in unique
+            if not any(kw != other and kw in other for other in unique)
+        ]
+        print(f"[keywords] LLM extracted: {keywords}")
+        return keywords if keywords else _extract_keywords_static(query)
+    except Exception as e:
+        print(f"[keywords] LLM extraction failed ({type(e).__name__}: {e}), using static fallback")
+        return _extract_keywords_static(query)
 
 
 def _keyword_hit_ratio(msg: Message, keywords: list[str]) -> float:
@@ -117,6 +169,7 @@ async def hybrid_search(
     folder: Optional[str] = None,
     has_attachments: Optional[bool] = None,
     accounts: Optional[list[str]] = None,
+    keywords: Optional[list[str]] = None,
 ) -> list[dict]:
     """
     Two-path hybrid search: vector similarity + keyword ILIKE matching.
@@ -124,6 +177,9 @@ async def hybrid_search(
     Results from both paths are merged so that messages containing literal
     query terms (names, domains) surface even when their embeddings aren't
     the closest match.
+
+    If ``keywords`` is provided, those are used directly for the ILIKE path.
+    Otherwise falls back to static stop-word extraction from ``query_text``.
     """
     meta_filters = _build_metadata_filters(sender, date_from, date_to, folder, has_attachments, accounts)
 
@@ -160,19 +216,24 @@ async def hybrid_search(
             candidates[msg.id] = (msg, float(vscore), 0.0)
 
     # --- Path 2: Keyword ILIKE search ---
-    keywords = _extract_keywords(query_text)
+    if keywords is None:
+        keywords = _extract_keywords_static(query_text)
     if keywords:
+        all_kw_in_recip = and_(*[
+            Message.recipients_to.ilike(f"%{kw}%") for kw in keywords
+        ]) if len(keywords) > 1 else Message.recipients_to.ilike(f"%{keywords[0]}%")
+
         kw_conditions = []
         hit_expr = literal(0)
         for kw in keywords:
             pat = f"%{kw}%"
-            match_any = or_(
+            kw_match = or_(
                 Message.sender.ilike(pat),
                 Message.subject.ilike(pat),
-                Message.recipients_to.ilike(pat),
+                and_(all_kw_in_recip, Message.recipients_to.ilike(pat)),
             )
-            kw_conditions.append(match_any)
-            hit_expr = hit_expr + case((match_any, 1), else_=0)
+            kw_conditions.append(kw_match)
+            hit_expr = hit_expr + case((kw_match, 1), else_=0)
 
         kw_hits = hit_expr.label("kw_hits")
 
@@ -190,6 +251,9 @@ async def hybrid_search(
 
         for msg, hits in kw_rows:
             hit_ratio = hits / len(keywords)
+            sender_subj = ((msg.sender or "") + " " + (msg.subject or "")).lower()
+            if not any(kw in sender_subj for kw in keywords):
+                hit_ratio *= 0.1
             if msg.id in candidates:
                 existing = candidates[msg.id]
                 candidates[msg.id] = (existing[0], existing[1], hit_ratio)
@@ -205,6 +269,8 @@ async def hybrid_search(
     ranked = []
     for msg, vscore, kscore in candidates.values():
         if keywords:
+            if kscore <= 0:
+                continue
             combined = VECTOR_WEIGHT * vscore + KEYWORD_WEIGHT * kscore
         else:
             combined = vscore
@@ -213,6 +279,8 @@ async def hybrid_search(
 
     ranked.sort(key=lambda x: x[1], reverse=True)
     print(f"[search] after threshold: {len(ranked)} results (returning top {top_k})")
+    for msg, score in ranked[:10]:
+        print(f"  [{score:.3f}] {(msg.sender or '')[:40]} | {(msg.subject or '')[:50]}")
 
     if ranked:
         best = ranked[0][1]

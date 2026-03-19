@@ -77,7 +77,13 @@ MAILLENS_OPENAI_API_KEY=sk-...
 docker compose up --build
 ```
 
-First startup takes a few minutes while it pulls the embedding model.
+Or with GPU acceleration (see [GPU Acceleration](#gpu-acceleration-optional)):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+```
+
+First startup takes a few minutes while it pulls the embedding model. If `active_provider` is set to `ollama`, the LLM model is also pulled automatically.
 
 6. Open **http://localhost:8000** in your browser.
 
@@ -98,6 +104,36 @@ To find your profile name, check Thunderbird's **Help > Troubleshooting Informat
 Point `MAILLENS_MAIL_DIR` to the profile directory itself -- MailLens will discover all `Mail/` and `ImapMail/` subdirectories automatically and derive account names from the folder structure.
 
 > **Windows + WSL note**: If Docker runs in WSL, use the WSL mount path (e.g., `/mnt/c/Users/you/AppData/Roaming/Thunderbird/Profiles/...`).
+
+## GPU Acceleration (Optional)
+
+If you have an NVIDIA GPU, you can pass it through to Ollama for dramatically faster embedding generation (ingestion) and local LLM inference. Without a GPU, everything runs on CPU -- it works, but is slower.
+
+### Prerequisites
+
+Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) on the host:
+
+```bash
+# Ubuntu / WSL
+sudo apt install nvidia-container-toolkit
+sudo systemctl restart docker
+```
+
+### Running with GPU
+
+Use the GPU override compose file:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+```
+
+Without a GPU, use the standard command:
+
+```bash
+docker compose up --build
+```
+
+You can verify GPU detection in the Ollama logs -- look for lines showing GPU layers being offloaded rather than "offloaded 0/N layers to GPU".
 
 ## Configuration
 
@@ -130,7 +166,28 @@ Sensitive values should be set as env vars rather than in the YAML file:
 
 Set `llm.active_provider` in `config.yaml` to one of: `anthropic`, `openai`, `gemini`, or `ollama`. Since `config.yaml` is volume-mounted, changes take effect after `docker compose restart app` -- no rebuild needed.
 
-To use a fully local setup with Ollama, set the provider to `ollama` and specify the model name. The model must be pulled into the Ollama container first (`docker compose exec ollama ollama pull llama3`).
+To use a fully local setup with Ollama, set `llm.active_provider: ollama` in config.yaml. The configured LLM model is pulled automatically on startup -- no manual download needed.
+
+### Local LLM Performance Notes
+
+- **First-time model download** -- The first startup with a new model will take several minutes while it downloads (e.g., ~5 GB for the 8B model). Subsequent startups are instant.
+- **First query of each session** -- Will be slow (30-60s) while Ollama loads the model into GPU/RAM. After that, responses are fast.
+- **GPU vs CPU** -- With an NVIDIA GPU, model loading and inference are dramatically faster. Without a GPU, everything runs on CPU; consider using a smaller model.
+
+### Ollama Model Choices
+
+Set `llm.ollama.model` in `config.yaml`. The model is auto-pulled on first startup.
+
+| Model | Size | VRAM needed | Notes |
+|---|---|---|---|
+| `llama3.2:1b` | 1.3 GB | ~2 GB | Fastest, lowest quality. Good for CPU-only setups. |
+| `llama3.2:3b` | 2.0 GB | ~3 GB | Fast, decent quality. Recommended for CPU or low-VRAM GPU. |
+| `llama3.1:8b` | 4.7 GB | ~7 GB | Good balance of speed and quality. Recommended for GPU. |
+| `gemma2:9b` | 5.4 GB | ~8 GB | Strong instruction following. Alternative to llama3.1:8b. |
+| `mistral:7b` | 4.1 GB | ~6 GB | Fast, good at summarization. |
+| `llama3.1:70b` | 40 GB | ~48 GB | Best local quality. Requires high-end hardware. |
+
+For 12 GB VRAM (e.g., RTX 3080 Ti), `llama3.1:8b` is the recommended sweet spot. For CPU-only or 4-6 GB VRAM, use `llama3.2:3b` or `llama3.2:1b`.
 
 ### Context Budget
 
@@ -149,7 +206,7 @@ Default context budgets reflect each provider's capabilities:
 | Gemini 2.5 Flash | 900,000 tokens |
 | Anthropic Claude | 180,000 tokens |
 | OpenAI GPT | 120,000 tokens |
-| Ollama (local) | 6,000 tokens |
+| Ollama (local) | 32,000 tokens |
 
 ## Architecture
 
@@ -364,6 +421,10 @@ Config-only changes (`config.yaml`) are volume-mounted and take effect with just
 ```bash
 docker compose restart app
 ```
+
+## Known Limitations / Future Improvements
+
+- **Body keyword search** -- The keyword ILIKE search currently matches against sender, subject, and recipients fields but not message body (a full-text scan of 66K+ bodies would add significant latency). Body content is covered by the vector similarity search via embeddings. This means if a contact uses an email address with no name overlap (e.g., `prettylady99@gmail.com` instead of `sandra.buhr@gmail.com`) and their name only appears in the body, the keyword path may miss it. In practice, most email clients include the display name in the sender field (e.g., `"Sandra Buhr" <prettylady99@gmail.com>`), so this is rarely an issue. A future improvement could add a PostgreSQL full-text search index (`tsvector`) on `body_clean` for fast body keyword matching without sequential scans.
 
 ## Tested With
 

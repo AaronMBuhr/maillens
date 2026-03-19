@@ -75,9 +75,9 @@ class GeminiConfig(BaseModel):
 
 class OllamaLLMConfig(BaseModel):
     url: str = "http://ollama:11434"
-    model: str = "llama3"
+    model: str = "llama3.2:3b"
     max_tokens: int = 4096
-    max_context_tokens: int = 6000
+    max_context_tokens: int = 8000
     temperature: float = 0.2
 
 

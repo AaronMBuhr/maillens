@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react'
+import React, { useState, useRef, useEffect, useMemo } from 'react'
 import { Send, Filter, ChevronDown, ChevronUp, RotateCcw } from 'lucide-react'
 
 export default function ChatPage() {
@@ -8,7 +8,7 @@ export default function ChatPage() {
   const [showFilters, setShowFilters] = useState(false)
   const [filters, setFilters] = useState({ sender: '', date_from: '', date_to: '', folder: '' })
   const [availableAccounts, setAvailableAccounts] = useState([])
-  const [selectedAccounts, setSelectedAccounts] = useState(null) // null = all
+  const [selectedAccounts, setSelectedAccounts] = useState(null)
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
 
@@ -23,6 +23,15 @@ export default function ChatPage() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+  const latestSources = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'assistant' && messages[i].sources?.length > 0) {
+        return messages[i].sources
+      }
+    }
+    return []
   }, [messages])
 
   const allSelected = selectedAccounts === null || (availableAccounts.length > 0 && selectedAccounts?.length === availableAccounts.length)
@@ -60,7 +69,8 @@ export default function ChatPage() {
     setLoading(true)
 
     const prevMessages = [...messages, { role: 'user', content: question }]
-    setMessages(prevMessages)
+    const withAssistant = [...prevMessages, { role: 'assistant', content: '', sources: [], status: 'Searching emails...' }]
+    setMessages(withAssistant)
 
     const conversationHistory = prevMessages
       .filter(m => m.content && (m.role === 'user' || m.role === 'assistant'))
@@ -90,56 +100,72 @@ export default function ChatPage() {
       const decoder = new TextDecoder()
       let assistantContent = ''
       let sources = []
+      let buffer = ''
 
-      setMessages(prev => [...prev, { role: 'assistant', content: '', sources: [], status: 'Searching emails...' }])
+      const processLine = (line) => {
+        if (!line.startsWith('data: ')) return
+        let data
+        try { data = JSON.parse(line.slice(6)) } catch { return }
+
+        if (data.type === 'status') {
+          setMessages(prev => {
+            const updated = [...prev]
+            updated[updated.length - 1] = {
+              ...updated[updated.length - 1],
+              status: data.message,
+            }
+            return updated
+          })
+        } else if (data.type === 'sources') {
+          sources = data.sources
+          setMessages(prev => {
+            const updated = [...prev]
+            updated[updated.length - 1] = {
+              ...updated[updated.length - 1],
+              sources,
+              status: `Analyzing ${sources.length} email${sources.length !== 1 ? 's' : ''}...`,
+            }
+            return updated
+          })
+        } else if (data.type === 'meta') {
+          setMessages(prev => {
+            const updated = [...prev]
+            updated[updated.length - 1] = {
+              ...updated[updated.length - 1],
+              status: `Sending ${data.context_messages} emails to LLM...`,
+            }
+            return updated
+          })
+        } else if (data.type === 'text') {
+          assistantContent += data.content
+          setMessages(prev => {
+            const updated = [...prev]
+            updated[updated.length - 1] = {
+              ...updated[updated.length - 1],
+              content: assistantContent,
+              status: null,
+            }
+            return updated
+          })
+        }
+      }
 
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
 
-        const chunk = decoder.decode(value)
-        const lines = chunk.split('\n')
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          try {
-            const data = JSON.parse(line.slice(6))
-
-            if (data.type === 'sources') {
-              sources = data.sources
-              setMessages(prev => {
-                const updated = [...prev]
-                updated[updated.length - 1] = {
-                  ...updated[updated.length - 1],
-                  sources,
-                  status: `Analyzing ${sources.length} email${sources.length !== 1 ? 's' : ''}...`,
-                }
-                return updated
-              })
-            } else if (data.type === 'meta') {
-              setMessages(prev => {
-                const updated = [...prev]
-                updated[updated.length - 1] = {
-                  ...updated[updated.length - 1],
-                  status: `Sending ${data.context_messages} emails to LLM...`,
-                }
-                return updated
-              })
-            } else if (data.type === 'text') {
-              assistantContent += data.content
-              setMessages(prev => {
-                const updated = [...prev]
-                updated[updated.length - 1] = {
-                  ...updated[updated.length - 1],
-                  content: assistantContent,
-                  status: null,
-                }
-                return updated
-              })
-            }
-          } catch (e) {
-            // skip unparseable lines
+        buffer += decoder.decode(value, { stream: true })
+        const parts = buffer.split('\n\n')
+        buffer = parts.pop()
+        for (const part of parts) {
+          for (const line of part.split('\n')) {
+            processLine(line)
           }
+        }
+      }
+      if (buffer.trim()) {
+        for (const line of buffer.split('\n')) {
+          processLine(line)
         }
       }
     } catch (err) {
@@ -172,38 +198,46 @@ export default function ChatPage() {
           </p>
         </div>
       ) : (
-        <div className="chat-messages">
-          <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '8px 0', position: 'sticky', top: 0, zIndex: 1 }}>
-            <button className="btn" onClick={startNewConversation} style={{ gap: 6, fontSize: 12 }}>
-              <RotateCcw size={13} /> New conversation
-            </button>
-          </div>
-          {messages.map((msg, i) => (
-            <div key={i} className="message">
-              <div className={`message-role ${msg.role}`}>
-                {msg.role === 'user' ? 'You' : 'MailLens'}
-              </div>
-              {msg.status && (
-                <div className="message-status"><span className="spinner" /> {msg.status}</div>
-              )}
-              <div className="message-content">{msg.content}</div>
-              {msg.sources && msg.sources.length > 0 && (
-                <div className="message-sources">
-                  {msg.sources.map((src, j) => (
-                    <div key={j} className="source-chip">
-                      <span className="source-sender">{src.sender?.split('<')[0]?.trim() || 'Unknown'}</span>
-                      <span className="source-date">
-                        {src.date ? new Date(src.date).toLocaleDateString() : ''}
-                      </span>
-                      {src.subject && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{src.subject}</div>}
-                    </div>
-                  ))}
-                </div>
-              )}
+        <>
+          <div className="chat-messages">
+            <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '8px 0', position: 'sticky', top: 0, zIndex: 1 }}>
+              <button className="btn" onClick={startNewConversation} style={{ gap: 6, fontSize: 12 }}>
+                <RotateCcw size={13} /> New conversation
+              </button>
             </div>
-          ))}
-          <div ref={messagesEndRef} />
-        </div>
+            {messages.map((msg, i) => (
+              <div key={i} className="message">
+                <div className={`message-role ${msg.role}`}>
+                  {msg.role === 'user' ? 'You' : 'MailLens'}
+                </div>
+                {msg.status && (
+                  <div className="message-status"><span className="spinner" /> {msg.status}</div>
+                )}
+                <div className="message-content">{msg.content}</div>
+              </div>
+            ))}
+            <div ref={messagesEndRef} />
+          </div>
+
+          {latestSources.length > 0 && (
+            <div className="chat-sources-pane">
+              <div className="chat-sources-header">
+                Sources ({latestSources.length})
+              </div>
+              <div className="chat-sources-list">
+                {latestSources.map((src, j) => (
+                  <div key={j} className="source-chip">
+                    <span className="source-sender">{src.sender?.split('<')[0]?.trim() || 'Unknown'}</span>
+                    <span className="source-date">
+                      {src.date ? new Date(src.date).toLocaleDateString() : ''}
+                    </span>
+                    {src.subject && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>{src.subject}</div>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       <div className="chat-input-area">
