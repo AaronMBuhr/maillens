@@ -28,6 +28,23 @@ _KEYWORD_EXTRACT_PROMPT = (
     "output the single word: NONE"
 )
 
+_QUERY_REWRITE_PROMPT = (
+    "You are a search query rewriter for a conversational email search system. "
+    "Given a conversation history and a follow-up question, rewrite the follow-up "
+    "as a fully self-contained search query that incorporates all relevant context "
+    "from the conversation (names, companies, topics, dates, etc.).\n\n"
+    "Rules:\n"
+    "- The rewritten query must be self-contained — someone reading it without "
+    "the conversation should understand exactly what emails to search for.\n"
+    "- Preserve all specific details from the follow-up (names, dates, keywords).\n"
+    "- Add context from the conversation that the follow-up implicitly refers to "
+    "(e.g., if the conversation was about 'Grafana interviews' and the follow-up "
+    "asks about 'three parts', include 'Grafana' in the rewrite).\n"
+    "- If the follow-up is already self-contained or introduces a completely new "
+    "topic unrelated to the conversation, return it unchanged.\n"
+    "- Output ONLY the rewritten query text, nothing else. No preamble, no quotes."
+)
+
 _STOP_WORDS = frozenset({
     "i", "me", "my", "we", "our", "you", "your", "he", "she", "it", "its",
     "they", "them", "their", "this", "that", "these", "those",
@@ -103,6 +120,52 @@ async def extract_search_keywords(query: str, llm_provider) -> list[str]:
         return _extract_keywords_static(query)
 
 
+async def rewrite_follow_up_query(
+    question: str,
+    conversation_history: list[dict],
+    llm_provider,
+) -> str:
+    """Rewrite a follow-up question as a standalone query using conversation context.
+
+    When a user asks a follow-up like "did they mention three parts?" after
+    discussing Grafana interviews, this rewrites it to include "Grafana" so
+    the retrieval step finds the right emails instead of doing a context-free search.
+
+    Returns the original question unchanged if there's no history or on failure.
+    """
+    if not conversation_history:
+        return question
+
+    history_lines = []
+    for turn in conversation_history:
+        role = turn.get("role", "user").capitalize()
+        content = turn.get("content", "")
+        if role == "Assistant" and len(content) > 500:
+            content = content[:500] + "..."
+        history_lines.append(f"{role}: {content}")
+
+    user_message = (
+        "Conversation so far:\n"
+        + "\n\n".join(history_lines)
+        + f"\n\nFollow-up question: {question}"
+    )
+
+    try:
+        rewritten = await llm_provider.complete(
+            system_prompt=_QUERY_REWRITE_PROMPT,
+            user_message=user_message,
+            context_messages=[],
+        )
+        rewritten = rewritten.strip().strip('"').strip("'")
+        if not rewritten:
+            return question
+        print(f"[rewrite] '{question}' → '{rewritten}'")
+        return rewritten
+    except Exception as e:
+        print(f"[rewrite] Failed ({type(e).__name__}: {e}), using original query")
+        return question
+
+
 def _keyword_hit_ratio(msg: Message, keywords: list[str]) -> float:
     """Fraction of keywords found in sender + subject + recipients."""
     if not keywords:
@@ -157,6 +220,9 @@ def _msg_to_dict(msg: Message, score: float) -> dict:
     }
 
 
+CONTINUITY_BOOST = 0.15
+
+
 async def hybrid_search(
     session: AsyncSession,
     query_embedding: list[float],
@@ -170,6 +236,7 @@ async def hybrid_search(
     has_attachments: Optional[bool] = None,
     accounts: Optional[list[str]] = None,
     keywords: Optional[list[str]] = None,
+    previous_source_ids: Optional[list[int]] = None,
 ) -> list[dict]:
     """
     Two-path hybrid search: vector similarity + keyword ILIKE matching.
@@ -261,19 +328,24 @@ async def hybrid_search(
                 candidates[msg.id] = (msg, 0.0, hit_ratio)
 
     # --- Merge and rank ---
+    prev_ids = set(previous_source_ids) if previous_source_ids else set()
     print(
         f"[search] vector={len(vec_rows)}, keyword={len(kw_rows) if keywords else 0}, "
         f"unique={len(candidates)}, keywords={keywords}, threshold={similarity_threshold:.3f}"
+        f"{f', prev_source_ids={len(prev_ids)}' if prev_ids else ''}"
     )
 
     ranked = []
     for msg, vscore, kscore in candidates.values():
+        is_previous = msg.id in prev_ids
         if keywords:
-            if kscore <= 0:
+            if kscore <= 0 and not is_previous:
                 continue
             combined = VECTOR_WEIGHT * vscore + KEYWORD_WEIGHT * kscore
         else:
             combined = vscore
+        if is_previous:
+            combined += CONTINUITY_BOOST
         if combined >= similarity_threshold:
             ranked.append((msg, combined))
 

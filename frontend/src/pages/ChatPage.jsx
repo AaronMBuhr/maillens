@@ -77,6 +77,13 @@ export default function ChatPage() {
       .slice(0, -1)
       .map(m => ({ role: m.role, content: m.content }))
 
+    const previousSourceIds = [...new Set(
+      messages
+        .filter(m => m.role === 'assistant' && m.sources?.length > 0)
+        .flatMap(m => m.sources.map(s => s.id))
+        .filter(id => id != null)
+    )]
+
     const body = { question, stream: true }
     if (filters.sender) body.sender = filters.sender
     if (filters.date_from) body.date_from = filters.date_from
@@ -84,6 +91,7 @@ export default function ChatPage() {
     if (filters.folder) body.folder = filters.folder
     if (selectedAccounts !== null) body.accounts = selectedAccounts
     if (conversationHistory.length > 0) body.conversation_history = conversationHistory
+    if (previousSourceIds.length > 0) body.previous_source_ids = previousSourceIds
 
     try {
       const resp = await fetch('/api/query/', {
@@ -107,7 +115,17 @@ export default function ChatPage() {
         let data
         try { data = JSON.parse(line.slice(6)) } catch { return }
 
-        if (data.type === 'status') {
+        if (data.type === 'rewritten_query') {
+          setMessages(prev => {
+            const updated = [...prev]
+            updated[updated.length - 1] = {
+              ...updated[updated.length - 1],
+              rewrittenQuery: data.query,
+              status: `Searching: "${data.query}"`,
+            }
+            return updated
+          })
+        } else if (data.type === 'status') {
           setMessages(prev => {
             const updated = [...prev]
             updated[updated.length - 1] = {

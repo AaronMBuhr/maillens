@@ -15,7 +15,7 @@ from backend.config import get_config
 from backend.ingestion.embedder import embed_texts
 from backend.llm.factory import SYSTEM_PROMPT, get_active_provider_config, get_llm_provider
 from backend.storage.db import get_session
-from backend.storage.queries import extract_search_keywords, get_thread_context, hybrid_search
+from backend.storage.queries import extract_search_keywords, get_thread_context, hybrid_search, rewrite_follow_up_query
 
 router = APIRouter()
 
@@ -39,6 +39,7 @@ class QueryRequest(BaseModel):
     top_k: Optional[int] = None
     stream: bool = True
     conversation_history: Optional[list[ConversationTurn]] = None
+    previous_source_ids: Optional[list[int]] = None
 
 
 class QueryResponse(BaseModel):
@@ -128,9 +129,13 @@ async def _run_search_pipeline(
     top_k = request.top_k or adaptive_k
     print(f"[query] budget={char_budget} chars ({char_budget // CHARS_PER_TOKEN} tokens), top_k={top_k}")
 
+    search_query = request.question
+    if history:
+        search_query = await rewrite_follow_up_query(request.question, history, provider)
+
     t0 = time.time()
-    keywords = await extract_search_keywords(request.question, provider)
-    query_embeddings = await embed_texts([request.question])
+    keywords = await extract_search_keywords(search_query, provider)
+    query_embeddings = await embed_texts([search_query])
     query_embedding = query_embeddings[0]
     embed_time = (time.time() - t0) * 1000
 
@@ -138,7 +143,7 @@ async def _run_search_pipeline(
     candidates = await hybrid_search(
         session=session,
         query_embedding=query_embedding,
-        query_text=request.question,
+        query_text=search_query,
         top_k=top_k,
         similarity_threshold=config.retrieval.similarity_threshold,
         sender=request.sender,
@@ -148,6 +153,7 @@ async def _run_search_pipeline(
         has_attachments=request.has_attachments,
         accounts=request.accounts,
         keywords=keywords,
+        previous_source_ids=request.previous_source_ids,
     )
 
     if config.retrieval.include_thread_context:
@@ -193,6 +199,7 @@ async def _run_search_pipeline(
         "embed_time": embed_time,
         "retrieval_time": retrieval_time,
         "char_budget": char_budget,
+        "search_query": search_query,
     }
 
 
@@ -224,6 +231,8 @@ async def query_email(
             retrieval_time = pipeline["retrieval_time"]
             char_budget = pipeline["char_budget"]
 
+            if pipeline["search_query"] != request.question:
+                yield f"data: {json.dumps({'type': 'rewritten_query', 'query': pipeline['search_query']})}\n\n"
             yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
             yield f"data: {json.dumps({'type': 'meta', 'embed_time_ms': embed_time, 'retrieval_time_ms': retrieval_time, 'context_messages': len(results), 'context_budget_tokens': char_budget // CHARS_PER_TOKEN})}\n\n"
 
