@@ -430,7 +430,7 @@ docker compose restart app
 
 ## Known Limitations / Future Improvements
 
-- **Body keyword search** -- The keyword ILIKE search currently matches against sender, subject, and recipients fields but not message body (a full-text scan of 66K+ bodies would add significant latency). Body content is covered by the vector similarity search via embeddings. This means if a contact uses an email address with no name overlap (e.g., `prettylady99@gmail.com` instead of `sandra.buhr@gmail.com`) and their name only appears in the body, the keyword path may miss it. In practice, most email clients include the display name in the sender field (e.g., `"Sandra Buhr" <prettylady99@gmail.com>`), so this is rarely an issue. A future improvement could add a PostgreSQL full-text search index (`tsvector`) on `body_clean` for fast body keyword matching without sequential scans.
+- **Body keyword search is SQL-side only for headers** -- The keyword ILIKE query matches sender, subject, and recipients, not message body (a full-text scan of 66K+ bodies would add significant latency). Body keywords are instead matched in Python, after retrieval: any vector candidate that no keyword hit in the header fields is re-checked against its body text and, on a whole-word hit, credited at `BODY_HIT_WEIGHT` (0.5) of a header hit. This keeps the `prettylady99@gmail.com` case working -- a contact whose name appears only in the body is still retrievable -- but only for messages the vector path already returned (`top_k * 3`). A message whose body contains the keyword yet whose embedding is not similar enough to make that window is still missed. A PostgreSQL full-text index (`tsvector`) on `body_clean` would close that remaining gap by giving the body its own SQL path.
 
 ## Tested With
 

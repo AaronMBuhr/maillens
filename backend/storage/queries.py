@@ -7,7 +7,10 @@ message, keeping the best chunk similarity.
 Path 2 — Keyword: extracts non-trivial words from the query and finds
 messages whose sender, subject, or recipients contain those words via ILIKE.
 
-Results from both paths are merged, scored, and returned.
+Results from both paths are merged, scored, and returned.  Vector candidates
+that no keyword hit in the header fields are given a second chance against
+their body text in Python (see BODY_HIT_WEIGHT), since the ILIKE path cannot
+search bodies without a sequential scan.
 """
 
 import re
@@ -79,6 +82,12 @@ _STOP_WORDS = frozenset({
 VECTOR_WEIGHT = 0.4
 KEYWORD_WEIGHT = 0.6
 
+# Credit for a keyword found only in the body, relative to a header hit.
+# Full credit would let body matches outrank subject matches; the 0.1 tier
+# used for recipients-only matches buries them under the relative cutoff.
+# Set to 0.0 to restore header-only keyword gating.
+BODY_HIT_WEIGHT = 0.5
+
 
 def _extract_keywords_static(text: str) -> list[str]:
     """Fallback: regex tokenization with static stop-word removal."""
@@ -105,7 +114,9 @@ async def extract_search_keywords(query: str, llm_provider) -> list[str]:
         words: list[str] = []
         for phrase in raw:
             for w in phrase.split():
-                cleaned = re.sub(r"[^a-z0-9]", "", w)
+                # Keep interior ".", "@" and "-" so domains and addresses
+                # ("acme.com") survive for ILIKE; "_" and "%" are LIKE wildcards.
+                cleaned = re.sub(r"[^a-z0-9.@-]", "", w).strip(".@-")
                 if cleaned and len(cleaned) > 1 and cleaned not in _STOP_WORDS:
                     words.append(cleaned)
         unique = [w for w in dict.fromkeys(words) if w != "none"]
@@ -166,16 +177,62 @@ async def rewrite_follow_up_query(
         return question
 
 
-def _keyword_hit_ratio(msg: Message, keywords: list[str]) -> float:
-    """Fraction of keywords found in sender + subject + recipients."""
+def _contains_word(haystack: str, needle: str) -> bool:
+    """True if ``needle`` occurs in ``haystack`` as a whole word.
+
+    Both arguments must already be lowercase.  Used for body matching, where
+    plain substring semantics would be far too loose: over kilobytes of prose
+    a short keyword becomes near-universal ("ai" occurs inside "email" in
+    almost every signature), which would turn the keyword gate into a no-op.
+
+    Implemented with ``str.find`` and two character tests rather than a regex
+    or a tokenisation pass -- this runs once per keyword for every candidate
+    the vector path returned, so it must not allocate per body.
+    """
+    n = len(needle)
+    start = 0
+    while True:
+        i = haystack.find(needle, start)
+        if i < 0:
+            return False
+        before_ok = i == 0 or not haystack[i - 1].isalnum()
+        end = i + n
+        after_ok = end == len(haystack) or not haystack[end].isalnum()
+        if before_ok and after_ok:
+            return True
+        start = i + 1
+
+
+def _keyword_hit_ratio(
+    msg: Message, keywords: list[str], include_body: bool = False
+) -> float:
+    """Fraction of keywords found in sender + subject + recipients.
+
+    With ``include_body``, the cleaned body is searched as well.  Header
+    fields stay in the haystack either way: a candidate can reach the body
+    check because it fell outside the ILIKE path's LIMIT rather than because
+    it missed on headers, and those keywords should still count.
+
+    Headers are matched on substring, mirroring the ILIKE path.  The body is
+    matched on whole words instead -- see _contains_word.  This is close to,
+    but not the same as, what a tsvector body index would do: tsvector also
+    stems ("lease" would match "leases") and keeps "foo_bar" as one lexeme.
+    """
     if not keywords:
         return 0.0
-    searchable = " ".join([
+    header = " ".join([
         msg.sender or "",
         msg.subject or "",
         msg.recipients_to or "",
     ]).lower()
-    hits = sum(1 for kw in keywords if kw in searchable)
+    hits = sum(1 for kw in keywords if kw in header)
+    if include_body and hits < len(keywords):
+        body = (msg.body_clean or msg.body_text or "").lower()
+        if body:
+            hits += sum(
+                1 for kw in keywords
+                if kw not in header and _contains_word(body, kw)
+            )
     return hits / len(keywords)
 
 
@@ -336,9 +393,21 @@ async def hybrid_search(
     )
 
     ranked = []
+    rescued_ids: set[int] = set()
     for msg, vscore, kscore in candidates.values():
         is_previous = msg.id in prev_ids
         if keywords:
+            # The ILIKE path only sees headers, so a message whose sole match
+            # is in the body arrives here with kscore == 0 and would be dropped
+            # regardless of similarity.  Check its body before the gate.
+            # Carried-over sources are skipped: they clear the gate anyway, and
+            # rescoring them would make a follow-up turn rank its own previous
+            # sources differently than the turn that produced them.
+            if kscore <= 0 and BODY_HIT_WEIGHT > 0 and not is_previous:
+                body_ratio = _keyword_hit_ratio(msg, keywords, include_body=True)
+                if body_ratio > 0:
+                    kscore = body_ratio * BODY_HIT_WEIGHT
+                    rescued_ids.add(msg.id)
             if kscore <= 0 and not is_previous:
                 continue
             combined = VECTOR_WEIGHT * vscore + KEYWORD_WEIGHT * kscore
@@ -350,7 +419,10 @@ async def hybrid_search(
             ranked.append((msg, combined))
 
     ranked.sort(key=lambda x: x[1], reverse=True)
-    print(f"[search] after threshold: {len(ranked)} results (returning top {top_k})")
+    print(
+        f"[search] after threshold: {len(ranked)} results (returning top {top_k})"
+        f"{f', body_rescued={len(rescued_ids)}' if rescued_ids else ''}"
+    )
     for msg, score in ranked[:10]:
         print(f"  [{score:.3f}] {(msg.sender or '')[:40]} | {(msg.subject or '')[:50]}")
 
@@ -358,7 +430,11 @@ async def hybrid_search(
         best = ranked[0][1]
         cutoff = best * 0.4
         ranked = [(m, s) for m, s in ranked if s >= cutoff]
-        print(f"[search] after relative cutoff ({cutoff:.3f}): {len(ranked)} results")
+        kept_rescues = sum(1 for m, _ in ranked[:top_k] if m.id in rescued_ids)
+        print(
+            f"[search] after relative cutoff ({cutoff:.3f}): {len(ranked)} results"
+            f"{f', {kept_rescues} of {len(rescued_ids)} body rescues kept' if rescued_ids else ''}"
+        )
 
     return [_msg_to_dict(msg, score) for msg, score in ranked[:top_k]]
 
