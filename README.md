@@ -15,7 +15,7 @@ Self-hosted email intelligence powered by LLMs. Ingest your Thunderbird email ar
 - **Multi-chunk embeddings** -- Long messages are split into chunks; each chunk is embedded individually and the best chunk match is used for retrieval
 - **Web UI** -- Chat interface with streaming responses, inbox browser with sorting and pagination, ingestion controls, and settings dashboard
 
-## Screenshots
+## User interface
 
 The **Query** page lets you chat with your email archive:
 
@@ -44,7 +44,7 @@ The **Inbox** page provides a traditional email browser:
 1. Clone the repo:
 
 ```bash
-git clone https://github.com/youruser/maillens.git
+git clone https://github.com/AaronMBuhr/maillens.git
 cd maillens
 ```
 
