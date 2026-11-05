@@ -2,7 +2,7 @@
 Messages API: browse and view indexed email messages.
 """
 
-from datetime import datetime
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.storage.db import get_session
 from backend.storage.models import Message
-from backend.storage.queries import get_accounts as _get_accounts
+from backend.storage.queries import day_bounds, get_accounts as _get_accounts
 
 router = APIRouter()
 
@@ -32,8 +32,9 @@ async def list_messages(
     sender: Optional[str] = None,
     folder: Optional[str] = None,
     subject: Optional[str] = None,
-    date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    tz_offset_minutes: int = Query(0, ge=-14 * 60, le=14 * 60),
     accounts: Optional[list[str]] = Query(None),
     sort_by: str = Query("date"),
     sort_dir: str = Query("desc"),
@@ -48,10 +49,11 @@ async def list_messages(
         stmt = stmt.where(Message.folder == folder)
     if subject:
         stmt = stmt.where(Message.subject.ilike(f"%{subject}%"))
-    if date_from:
-        stmt = stmt.where(Message.date >= date_from)
-    if date_to:
-        stmt = stmt.where(Message.date <= date_to)
+    range_start, range_end = day_bounds(date_from, date_to, tz_offset_minutes)
+    if range_start:
+        stmt = stmt.where(Message.date >= range_start)
+    if range_end:
+        stmt = stmt.where(Message.date < range_end)
     if accounts:
         stmt = stmt.where(Message.account.in_(accounts))
 

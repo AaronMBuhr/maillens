@@ -14,7 +14,8 @@ search bodies without a sequential scan.
 """
 
 import re
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import case, literal, select, and_, or_, func, desc
@@ -27,9 +28,23 @@ _KEYWORD_EXTRACT_PROMPT = (
     "matched against email senders, recipients, and subjects. This means proper "
     "nouns (people's names, company names), domain names, and specific phrases. "
     "Omit generic/instruction words like 'summarize', 'find', 'common', 'topic', etc. "
+    "Never output time expressions ('today', 'last month', 'in March') as keywords.\n\n"
     "Output one keyword per line, lowercase. If there are no search-worthy terms, "
-    "output the single word: NONE"
+    "output the single word: NONE\n\n"
+    "Date range: the message gives today's date. ONLY if the query explicitly limits "
+    "WHEN the emails were sent (e.g. 'today', 'yesterday', 'last week', 'in the past "
+    "3 months', 'since March', 'in 2023', 'before June 2024'), also output one or both "
+    "of these lines, with inclusive calendar dates:\n"
+    "DATE_FROM: YYYY-MM-DD\n"
+    "DATE_TO: YYYY-MM-DD\n"
+    "For a single day, DATE_FROM and DATE_TO are the same date. "
+    "Open-ended ranges use only one line ('since March' -> DATE_FROM only). "
+    "Do NOT output date lines for phrases that are not a time span, such as "
+    "'the last time we talked', 'our first meeting', or 'the latest invoice'."
 )
+
+# Lines the keyword extractor may add to declare a date range.
+_DATE_LINE_RE = re.compile(r"^\W*date_(from|to)\s*[:=]\s*(\S+)", re.IGNORECASE)
 
 _QUERY_REWRITE_PROMPT = (
     "You are a search query rewriter for a conversational email search system. "
@@ -77,6 +92,13 @@ _STOP_WORDS = frozenset({
     "important", "interesting", "specific", "general", "overall",
     "first", "last", "latest", "earliest", "oldest", "newest",
     "sent", "received", "wrote", "written", "replied", "reply",
+    # Time expressions: handled as a date range, never as header keywords.
+    # Month names are deliberately absent ("june" may be a person).
+    "today", "todays", "yesterday", "tomorrow", "tonight", "now", "ago", "since",
+    "past", "previous", "prior", "next", "current", "until",
+    "day", "days", "week", "weeks", "weekend", "month", "months",
+    "year", "years", "quarter", "daily", "weekly", "monthly", "yearly",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
 })
 
 VECTOR_WEIGHT = 0.4
@@ -95,40 +117,124 @@ def _extract_keywords_static(text: str) -> list[str]:
     return [w for w in words if w not in _STOP_WORDS and len(w) > 1]
 
 
-async def extract_search_keywords(query: str, llm_provider) -> list[str]:
-    """Use the active LLM to extract search-worthy keywords from the query.
+@dataclass
+class SearchTerms:
+    """What the extractor pulled out of a query.
 
-    Falls back to static stop-word extraction on any failure.
+    ``date_from`` / ``date_to`` are inclusive calendar dates in the user's
+    timezone; either may be None for an open-ended or absent range.
+    """
+
+    keywords: list[str] = field(default_factory=list)
+    date_from: Optional[date] = None
+    date_to: Optional[date] = None
+
+
+def _validate_date_range(
+    date_from: Optional[date], date_to: Optional[date], today: date
+) -> tuple[Optional[date], Optional[date]]:
+    """Sanity-check an LLM-inferred range; return (None, None) if it is unusable.
+
+    Emails cannot come from the future, so ``date_to`` is clamped to today and
+    a range that starts after today is discarded, as is an inverted range.
+    """
+    if date_to is not None and date_to > today:
+        date_to = today
+    if date_from is not None and date_from > today:
+        return None, None
+    if date_from is not None and date_to is not None and date_from > date_to:
+        return None, None
+    return date_from, date_to
+
+
+def day_bounds(
+    date_from: Optional[date],
+    date_to: Optional[date],
+    utc_offset_minutes: int = 0,
+) -> tuple[Optional[datetime], Optional[datetime]]:
+    """Turn inclusive calendar dates into a half-open datetime range.
+
+    Returns ``(start, end)`` for filtering ``start <= Message.date < end``:
+    ``start`` is midnight at the beginning of ``date_from`` and ``end`` is
+    midnight at the beginning of the day *after* ``date_to``, both in the
+    timezone ``utc_offset_minutes`` east of UTC.  So ``date_to`` covers its
+    whole day, and ``date_from == date_to`` selects exactly that day.
+    """
+    tz = timezone(timedelta(minutes=utc_offset_minutes))
+    start = datetime.combine(date_from, time.min, tzinfo=tz) if date_from else None
+    end = (
+        datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=tz)
+        if date_to else None
+    )
+    return start, end
+
+
+def _split_date_lines(response: str) -> tuple[list[str], Optional[date], Optional[date]]:
+    """Separate DATE_FROM/DATE_TO lines from keyword lines in an LLM reply.
+
+    Unparseable dates (``DATE_TO: NONE``, ``DATE_FROM: last week``) are ignored.
+    """
+    keyword_lines: list[str] = []
+    found: dict[str, date] = {}
+    for line in response.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _DATE_LINE_RE.match(line)
+        if m:
+            try:
+                found[m.group(1).lower()] = date.fromisoformat(m.group(2).strip(".,"))
+            except ValueError:
+                pass
+            continue
+        keyword_lines.append(line.lower())
+    return keyword_lines, found.get("from"), found.get("to")
+
+
+async def extract_search_terms(query: str, llm_provider, today: date) -> SearchTerms:
+    """Use the active LLM to extract keywords and any explicit date range.
+
+    One LLM call yields both.  ``today`` is the user's current date, which the
+    model needs to resolve relative phrases such as "last month".  Keywords
+    fall back to static stop-word extraction on any failure; the date range
+    simply comes back empty.
     """
     try:
         response = await llm_provider.complete(
             system_prompt=_KEYWORD_EXTRACT_PROMPT,
-            user_message=query,
+            user_message=f"Today's date: {today.isoformat()} ({today:%A})\nQuery: {query}",
             context_messages=[],
         )
-        lines = [ln.strip().lower() for ln in response.strip().splitlines() if ln.strip()]
-        if lines == ["none"] or not lines:
-            print(f"[keywords] LLM returned no keywords, falling back to static")
-            return _extract_keywords_static(query)
-        raw = [re.sub(r"^[^a-z0-9]+|[^a-z0-9]+$", "", ln) for ln in lines]
-        words: list[str] = []
-        for phrase in raw:
-            for w in phrase.split():
-                # Keep interior ".", "@" and "-" so domains and addresses
-                # ("acme.com") survive for ILIKE; "_" and "%" are LIKE wildcards.
-                cleaned = re.sub(r"[^a-z0-9.@-]", "", w).strip(".@-")
-                if cleaned and len(cleaned) > 1 and cleaned not in _STOP_WORDS:
-                    words.append(cleaned)
-        unique = [w for w in dict.fromkeys(words) if w != "none"]
-        keywords = [
-            kw for kw in unique
-            if not any(kw != other and kw in other for other in unique)
-        ]
-        print(f"[keywords] LLM extracted: {keywords}")
-        return keywords if keywords else _extract_keywords_static(query)
     except Exception as e:
         print(f"[keywords] LLM extraction failed ({type(e).__name__}: {e}), using static fallback")
-        return _extract_keywords_static(query)
+        return SearchTerms(keywords=_extract_keywords_static(query))
+
+    lines, raw_from, raw_to = _split_date_lines(response)
+    date_from, date_to = _validate_date_range(raw_from, raw_to, today)
+    if (raw_from, raw_to) != (date_from, date_to):
+        print(f"[keywords] adjusted LLM date range {raw_from}..{raw_to} -> {date_from}..{date_to}")
+    if date_from or date_to:
+        print(f"[keywords] LLM date range: {date_from}..{date_to}")
+
+    if lines == ["none"] or not lines:
+        print(f"[keywords] LLM returned no keywords, falling back to static")
+        return SearchTerms(_extract_keywords_static(query), date_from, date_to)
+    raw = [re.sub(r"^[^a-z0-9]+|[^a-z0-9]+$", "", ln) for ln in lines]
+    words: list[str] = []
+    for phrase in raw:
+        for w in phrase.split():
+            # Keep interior ".", "@" and "-" so domains and addresses
+            # ("acme.com") survive for ILIKE; "_" and "%" are LIKE wildcards.
+            cleaned = re.sub(r"[^a-z0-9.@-]", "", w).strip(".@-")
+            if cleaned and len(cleaned) > 1 and cleaned not in _STOP_WORDS:
+                words.append(cleaned)
+    unique = [w for w in dict.fromkeys(words) if w != "none"]
+    keywords = [
+        kw for kw in unique
+        if not any(kw != other and kw in other for other in unique)
+    ]
+    print(f"[keywords] LLM extracted: {keywords}")
+    return SearchTerms(keywords or _extract_keywords_static(query), date_from, date_to)
 
 
 async def rewrite_follow_up_query(
@@ -239,7 +345,7 @@ def _keyword_hit_ratio(
 def _build_metadata_filters(
     sender: Optional[str],
     date_from: Optional[datetime],
-    date_to: Optional[datetime],
+    date_before: Optional[datetime],
     folder: Optional[str],
     has_attachments: Optional[bool],
     accounts: Optional[list[str]],
@@ -249,8 +355,8 @@ def _build_metadata_filters(
         filters.append(Message.sender.ilike(f"%{sender}%"))
     if date_from:
         filters.append(Message.date >= date_from)
-    if date_to:
-        filters.append(Message.date <= date_to)
+    if date_before:
+        filters.append(Message.date < date_before)
     if folder:
         filters.append(Message.folder == folder)
     if has_attachments is not None:
@@ -288,7 +394,7 @@ async def hybrid_search(
     similarity_threshold: float = 0.05,
     sender: Optional[str] = None,
     date_from: Optional[datetime] = None,
-    date_to: Optional[datetime] = None,
+    date_before: Optional[datetime] = None,
     folder: Optional[str] = None,
     has_attachments: Optional[bool] = None,
     accounts: Optional[list[str]] = None,
@@ -304,8 +410,11 @@ async def hybrid_search(
 
     If ``keywords`` is provided, those are used directly for the ILIKE path.
     Otherwise falls back to static stop-word extraction from ``query_text``.
+
+    The date filter is half-open: ``date_from <= Message.date < date_before``
+    (see ``day_bounds`` for building it from inclusive calendar dates).
     """
-    meta_filters = _build_metadata_filters(sender, date_from, date_to, folder, has_attachments, accounts)
+    meta_filters = _build_metadata_filters(sender, date_from, date_before, folder, has_attachments, accounts)
 
     # --- Path 1: Vector similarity search ---
     chunk_sub = (
@@ -443,14 +552,21 @@ async def get_thread_context(
     session: AsyncSession,
     thread_id: int,
     limit: int = 10,
+    date_from: Optional[datetime] = None,
+    date_before: Optional[datetime] = None,
 ) -> list[dict]:
-    """Get messages in a thread, ordered by date."""
-    stmt = (
-        select(Message)
-        .where(Message.thread_id == thread_id)
-        .order_by(Message.date)
-        .limit(limit)
-    )
+    """Get messages in a thread, ordered by date.
+
+    The optional half-open ``[date_from, date_before)`` range keeps thread
+    expansion inside the search's date filter; it is applied in SQL so the
+    ``limit`` counts only in-range messages.
+    """
+    stmt = select(Message).where(Message.thread_id == thread_id)
+    if date_from:
+        stmt = stmt.where(Message.date >= date_from)
+    if date_before:
+        stmt = stmt.where(Message.date < date_before)
+    stmt = stmt.order_by(Message.date).limit(limit)
     result = await session.execute(stmt)
     messages = result.scalars().all()
 

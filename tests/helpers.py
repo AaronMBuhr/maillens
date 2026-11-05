@@ -20,6 +20,9 @@ class _FakeResult:
     def all(self):
         return list(self._rows)
 
+    def scalars(self):
+        return self
+
 
 class FakeSession:
     """Stand-in for AsyncSession that returns queued row lists in order.

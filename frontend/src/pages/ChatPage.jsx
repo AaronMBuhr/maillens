@@ -7,6 +7,10 @@ export default function ChatPage() {
   const [loading, setLoading] = useState(false)
   const [showFilters, setShowFilters] = useState(false)
   const [filters, setFilters] = useState({ sender: '', date_from: '', date_to: '', folder: '' })
+  // True while the date pickers hold a range the backend inferred from the
+  // question ("last month").  Inferred dates are shown but not sent, so the
+  // next question can infer its own range; editing a picker makes them explicit.
+  const [datesInferred, setDatesInferred] = useState(false)
   const [availableAccounts, setAvailableAccounts] = useState([])
   const [selectedAccounts, setSelectedAccounts] = useState(null)
   const messagesEndRef = useRef(null)
@@ -55,8 +59,20 @@ export default function ChatPage() {
   const selectAll = () => setSelectedAccounts(null)
   const selectNone = () => setSelectedAccounts([])
 
+  const clearInferredDates = () => {
+    if (!datesInferred) return
+    setFilters(f => ({ ...f, date_from: '', date_to: '' }))
+    setDatesInferred(false)
+  }
+
+  const setDateFilter = (key, value) => {
+    setFilters(f => ({ ...f, [key]: value }))
+    setDatesInferred(false)
+  }
+
   const startNewConversation = () => {
     setMessages([])
+    clearInferredDates()
     setInput('')
     inputRef.current?.focus()
   }
@@ -84,10 +100,14 @@ export default function ChatPage() {
         .filter(id => id != null)
     )]
 
-    const body = { question, stream: true }
+    const body = { question, stream: true, tz_offset_minutes: -new Date().getTimezoneOffset() }
     if (filters.sender) body.sender = filters.sender
-    if (filters.date_from) body.date_from = filters.date_from
-    if (filters.date_to) body.date_to = filters.date_to
+    if (!datesInferred) {
+      if (filters.date_from) body.date_from = filters.date_from
+      if (filters.date_to) body.date_to = filters.date_to
+    }
+    // Inferred dates belonged to the previous question; this one infers afresh.
+    clearInferredDates()
     if (filters.folder) body.folder = filters.folder
     if (selectedAccounts !== null) body.accounts = selectedAccounts
     if (conversationHistory.length > 0) body.conversation_history = conversationHistory
@@ -125,6 +145,11 @@ export default function ChatPage() {
             }
             return updated
           })
+        } else if (data.type === 'date_range') {
+          if (data.source === 'inferred') {
+            setFilters(f => ({ ...f, date_from: data.from || '', date_to: data.to || '' }))
+            setDatesInferred(true)
+          }
         } else if (data.type === 'status') {
           setMessages(prev => {
             const updated = [...prev]
@@ -267,6 +292,11 @@ export default function ChatPage() {
           <Filter size={14} />
           Filters
           {showFilters ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+          {datesInferred && (
+            <span style={{ fontSize: 11, color: 'var(--text-muted)', marginLeft: 6 }}>
+              dates inferred: {filters.date_from || '…'} – {filters.date_to || '…'}
+            </span>
+          )}
         </button>
 
         {showFilters && (
@@ -282,15 +312,19 @@ export default function ChatPage() {
                 className="filter-input"
                 type="date"
                 placeholder="From date"
+                title={datesInferred ? 'Inferred from your question; edit to make it a fixed filter' : 'From date (inclusive)'}
+                style={datesInferred ? { fontStyle: 'italic', opacity: 0.7 } : undefined}
                 value={filters.date_from}
-                onChange={e => setFilters(f => ({ ...f, date_from: e.target.value }))}
+                onChange={e => setDateFilter('date_from', e.target.value)}
               />
               <input
                 className="filter-input"
                 type="date"
                 placeholder="To date"
+                title={datesInferred ? 'Inferred from your question; edit to make it a fixed filter' : 'To date (inclusive)'}
+                style={datesInferred ? { fontStyle: 'italic', opacity: 0.7 } : undefined}
                 value={filters.date_to}
-                onChange={e => setFilters(f => ({ ...f, date_to: e.target.value }))}
+                onChange={e => setDateFilter('date_to', e.target.value)}
               />
               <input
                 className="filter-input"

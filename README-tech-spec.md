@@ -108,7 +108,7 @@ storage/      SQLAlchemy models, async session factory, retrieval queries
 config.py     YAML + environment overlay, singleton
 ```
 
-Dependencies flow strictly downward. `storage/queries.py` is the one exception: `extract_search_keywords()` and `rewrite_follow_up_query()` accept an `llm_provider` argument (duck-typed, not imported), so the storage layer invokes an LLM without depending on the `llm` package.
+Dependencies flow strictly downward. `storage/queries.py` is the one exception: `extract_search_terms()` and `rewrite_follow_up_query()` accept an `llm_provider` argument (duck-typed, not imported), so the storage layer invokes an LLM without depending on the `llm` package.
 
 ---
 
@@ -441,7 +441,7 @@ Because `find_root` resolves against `parent_map` built only from *this run's* m
 
 The keyword list is the more heavily weighted signal, so it is produced by the **active LLM**, not by tokenisation.
 
-`extract_search_keywords()` (`queries.py:98-131`) calls `llm_provider.complete()` with `_KEYWORD_EXTRACT_PROMPT` (`queries.py:24-32`) and an empty `context_messages`. The prompt instructs the model to emit only search-worthy terms — proper nouns, company names, domains, specific phrases — one per line, lowercase, or the literal `NONE`.
+`extract_search_terms()` (`queries.py`) calls `llm_provider.complete()` with `_KEYWORD_EXTRACT_PROMPT` and an empty `context_messages`, and returns a `SearchTerms(keywords, date_from, date_to)`. The user message is `Today's date: YYYY-MM-DD (Weekday)` followed by the query. The prompt instructs the model to emit only search-worthy terms — proper nouns, company names, domains, specific phrases — one per line, lowercase, or the literal `NONE`, and never time expressions.
 
 Post-processing (`queries.py:109-128`):
 
@@ -450,6 +450,8 @@ Post-processing (`queries.py:109-128`):
 3. Split multi-word phrases into individual words. Within each word keep only `a-z`, `0-9`, `.`, `@` and `-`, then trim `.`/`@`/`-` from the ends (`queries.py:117-119`), so domains and addresses the prompt asks for (`acme.com`, `jane.doe@acme.com`) survive intact for `ILIKE`. `_` and `%` are removed because they are `LIKE` wildcards. Drop words of length ≤ 1 and anything in `_STOP_WORDS`.
 4. Deduplicate preserving order (`dict.fromkeys`).
 5. **Substring elimination** (`queries.py:123-126`): drop any keyword that is a proper substring of another surviving keyword — `["jane", "janedoe"]` collapses to `["janedoe"]`, preventing the shorter, noisier term from inflating hit counts.
+
+**Date range (same call).** When the query explicitly limits when emails were sent ("today", "last month", "since March"), the model also emits `DATE_FROM: YYYY-MM-DD` and/or `DATE_TO: YYYY-MM-DD` (inclusive; equal for a single day). `_split_date_lines()` removes these lines before keyword processing; unparseable values are ignored. `_validate_date_range()` clamps `DATE_TO` to today and discards a range that starts after today or is inverted. Time words (`today`, `week`, `month`, weekdays, …) are in `_STOP_WORDS` as a backstop; month names are not, since they double as personal names. On LLM failure there is no inferred range. In `_run_search_pipeline()` an explicit `date_from`/`date_to` from the request takes precedence over the inferred range; whichever is used is reported in a `date_range` SSE event.
 6. If nothing survives, fall back to static extraction.
 
 The fallback `_extract_keywords_static()` (`queries.py:92-95`) is regex tokenisation (`[a-zA-Z0-9]+`), lowercased, filtered against `_STOP_WORDS` and length > 1.
@@ -561,7 +563,7 @@ Diagnostics for each stage are printed to stdout (`queries.py:389-393, 422-427, 
 | Parameter | Predicate |
 |---|---|
 | `sender` | `sender ILIKE '%value%'` |
-| `date_from` / `date_to` | `date >= …` / `date <= …` |
+| `date_from` / `date_before` | `date >= …` / `date < …` (half-open; built from inclusive calendar dates by `day_bounds()`) |
 | `folder` | `folder = value` (exact) |
 | `has_attachments` | `has_attachments = value` |
 | `accounts` | `account IN (…)` |
@@ -579,7 +581,7 @@ Diagnostics for each stage are printed to stdout (`queries.py:389-393, 422-427, 
                                                 (request.top_k overrides)
 4.  Rewrite follow-up  ── LLM call #1 ──        rewrite_follow_up_query          query.py:132-134
                                                 (only when history is present)
-5.  Extract keywords   ── LLM call #2 ──        extract_search_keywords          query.py:137
+5.  Extract keywords + date range ── LLM call #2 ── extract_search_terms      query.py
 6.  Embed search query ── Ollama call ──        embed_texts                      query.py:138
     ├─ emit `rewritten_query` (if changed)
 7.  Hybrid search                               hybrid_search                    query.py:143-157
@@ -594,7 +596,7 @@ Diagnostics for each stage are printed to stdout (`queries.py:389-393, 422-427, 
 
 Steps 4–6 are sequential awaits; on a conversational turn against a local model they can exceed the retrieval and generation time combined.
 
-**Thread expansion** (step 8, gated on `retrieval.include_thread_context`) iterates the **top 10** ranked results, and for each distinct `thread_id` not yet seen, fetches up to 10 sibling messages ordered by date (`get_thread_context`, `queries.py:442-472`). Siblings not already present are appended to the candidate list. Two consequences:
+**Thread expansion** (step 8, gated on `retrieval.include_thread_context`) iterates the **top 10** ranked results, and for each distinct `thread_id` not yet seen, fetches up to 10 sibling messages ordered by date, restricted in SQL to the active date range if any (`get_thread_context`, `queries.py:442-472`). Siblings not already present are appended to the candidate list. Two consequences:
 
 - Expansion happens *after* `top_k` truncation but *before* budget trimming, so thread siblings compete for budget with — and can displace — lower-ranked genuine hits.
 - `get_thread_context()` returns dicts without a `similarity` key (`queries.py:457-472`), so thread-expanded entries surface in the SSE `sources` payload with `similarity: null`.
@@ -741,7 +743,8 @@ Request (`QueryRequest`, `query.py:31-42`):
 |---|---|---|---|
 | `question` | `str` | required | The user's question. |
 | `sender` | `str?` | — | `ILIKE` filter. |
-| `date_from` / `date_to` | `datetime?` | — | Inclusive bounds. |
+| `date_from` / `date_to` | `date?` | — | Inclusive calendar days in the user's timezone (`date_to` covers its whole day). When either is set, a range inferred from the question is ignored. |
+| `tz_offset_minutes` | `int` | `0` | Minutes east of UTC (`-getTimezoneOffset()`); defines "today" and day boundaries. Range ±840. |
 | `folder` | `str?` | — | Exact match. |
 | `has_attachments` | `bool?` | — | Exact match. |
 | `accounts` | `list[str]?` | — | `IN` filter. |
@@ -771,7 +774,8 @@ Returns `IngestionProgress.to_dict()`: `status` (`idle|running|completed|failed`
 | `per_page` | `int` | 50 | `1–200` |
 | `sender`, `subject` | `str?` | — | `ILIKE` |
 | `folder` | `str?` | — | exact |
-| `date_from`, `date_to` | `datetime?` | — | bounds |
+| `date_from`, `date_to` | `date?` | — | inclusive calendar days |
+| `tz_offset_minutes` | `int` | `0` | ±840; day boundaries |
 | `accounts` | `list[str]?` | — | `IN` |
 | `sort_by` | `str` | `date` | `date\|sender\|subject\|account\|folder` |
 | `sort_dir` | `str` | `desc` | `asc\|desc` |
@@ -802,18 +806,19 @@ Body `{provider: str}`. Validates against `["anthropic", "openai", "gemini", "ol
 
 ## 12. SSE streaming protocol
 
-`text/event-stream` with `Cache-Control: no-cache`, `Connection: keep-alive` (`query.py:253-260`). Each event is a single `data: <json>\n\n` frame. There are **six** event types:
+`text/event-stream` with `Cache-Control: no-cache`, `Connection: keep-alive` (`query.py:253-260`). Each event is a single `data: <json>\n\n` frame. There are **seven** event types:
 
 | # | `type` | Payload | Emitted |
 |---|---|---|---|
 | 1 | `status` | `{message}` | Immediately on connect — `"Extracting keywords..."` (`query.py:223`). Flushes headers so the UI can render before the pipeline blocks. |
 | 2 | `rewritten_query` | `{query}` | Only when the rewrite changed the question (`query.py:234-235`). |
-| 3 | `sources` | `{sources: [{id, subject, sender, recipients_to, date, account, folder, similarity, snippet}]}` | After retrieval, before the LLM call. `snippet` is 200 chars of `body_clean`. |
-| 4 | `meta` | `{embed_time_ms, retrieval_time_ms, context_messages, context_budget_tokens}` | Immediately after `sources`. |
-| 5 | `text` | `{content}` | Once per token/chunk from the provider. |
-| 6 | `done` | `{}` | Terminal frame — always emitted, including after an error. |
+| 3 | `date_range` | `{from, to, source}` | Only when a date filter applied. `source` is `filter` (explicit request dates) or `inferred` (from the question); `from`/`to` are `YYYY-MM-DD` or `null`. The chat UI soft-fills its date pickers with inferred ranges. |
+| 4 | `sources` | `{sources: [{id, subject, sender, recipients_to, date, account, folder, similarity, snippet}]}` | After retrieval, before the LLM call. `snippet` is 200 chars of `body_clean`. |
+| 5 | `meta` | `{embed_time_ms, retrieval_time_ms, context_messages, context_budget_tokens}` | Immediately after `sources`. |
+| 6 | `text` | `{content}` | Once per token/chunk from the provider. |
+| 7 | `done` | `{}` | Terminal frame — always emitted, including after an error. |
 
-Ordering is fixed: `status` → [`rewritten_query`] → `sources` → `meta` → `text`* → `done`. LLM errors are delivered as a `text` frame containing `[LLM Error: …]` (`query.py:247-249`), so the stream always terminates cleanly rather than aborting the connection.
+Ordering is fixed: `status` → [`rewritten_query`] → [`date_range`] → `sources` → `meta` → `text`* → `done`. LLM errors are delivered as a `text` frame containing `[LLM Error: …]` (`query.py:247-249`), so the stream always terminates cleanly rather than aborting the connection.
 
 Client parsing (`ChatPage.jsx:171-188`) buffers the byte stream, splits on `\n\n` and retains the trailing partial frame across reads, then processes any residual buffer after `done` — correct handling for frames split across TCP segments.
 
@@ -1005,7 +1010,7 @@ Points where `README.md` describes behaviour the code no longer has. The code is
 | 2 | *(unmentioned)* | Follow-up queries are rewritten by an LLM call before retrieval (`rewrite_follow_up_query`). A conversational turn costs two extra pre-retrieval LLM round-trips. |
 | 3 | Keyword condition is `or_(sender.ilike, subject.ilike, recipients_to.ilike)` (README:325) | Recipients only participate when **all** keywords appear in `recipients_to`. A further ×0.1 demotion applies when no keyword hits sender or subject. |
 | 4 | *(unmentioned)* | `previous_source_ids` grants `+0.15` (`CONTINUITY_BOOST`) and exempts prior sources from the keyword gate. |
-| 5 | "four event types" (README:379) | Six: `status`, `rewritten_query`, `sources`, `meta`, `text`, `done`. |
+| 5 | "four event types" (README:379) | Seven: `status`, `rewritten_query`, `date_range`, `sources`, `meta`, `text`, `done`. |
 | 6 | Ollama default context budget 32,000 (README:215) | `8000` in both `config.py:80` and `config.example.yaml`. |
 | 7 | Env var table lists `MAILLENS_MAIL_DIR` as overriding the mail directory (README:164) | `MAILLENS_MAIL_DIR` is compose-only (bind-mount source). The config override is `MAILLENS_MAIL_DIRECTORY`. Likewise `MAILLENS_PORT` is compose-only. |
 | 8 | `max_tokens` values | README's provider table omits that `config.py` and `config.example.yaml` disagree for Anthropic (4096/8192), OpenAI (4096/32768), and Gemini (8192/32768). |

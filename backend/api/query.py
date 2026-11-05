@@ -3,19 +3,25 @@ Query API: natural language email search and analysis.
 """
 
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import get_config
 from backend.ingestion.embedder import embed_texts
 from backend.llm.factory import SYSTEM_PROMPT, get_active_provider_config, get_llm_provider
 from backend.storage.db import get_session
-from backend.storage.queries import extract_search_keywords, get_thread_context, hybrid_search, rewrite_follow_up_query
+from backend.storage.queries import (
+    day_bounds,
+    extract_search_terms,
+    get_thread_context,
+    hybrid_search,
+    rewrite_follow_up_query,
+)
 
 router = APIRouter()
 
@@ -31,8 +37,14 @@ class ConversationTurn(BaseModel):
 class QueryRequest(BaseModel):
     question: str
     sender: Optional[str] = None
-    date_from: Optional[datetime] = None
-    date_to: Optional[datetime] = None
+    # Inclusive calendar dates in the user's timezone; date_to covers its
+    # whole day.  When either is set, any range implied by the question
+    # ("last month") is ignored.
+    date_from: Optional[date] = None
+    date_to: Optional[date] = None
+    # Minutes east of UTC (JS: -new Date().getTimezoneOffset()).  Defines
+    # "today" and where day boundaries fall; UTC when omitted.
+    tz_offset_minutes: int = Field(0, ge=-14 * 60, le=14 * 60)
     folder: Optional[str] = None
     has_attachments: Optional[bool] = None
     accounts: Optional[list[str]] = None
@@ -134,7 +146,20 @@ async def _run_search_pipeline(
         search_query = await rewrite_follow_up_query(request.question, history, provider)
 
     t0 = time.time()
-    keywords = await extract_search_keywords(search_query, provider)
+    user_tz = timezone(timedelta(minutes=request.tz_offset_minutes))
+    today = datetime.now(user_tz).date()
+    terms = await extract_search_terms(search_query, provider, today)
+
+    # An explicit filter from the UI always wins over an inferred range.
+    if request.date_from or request.date_to:
+        date_from, date_to, date_source = request.date_from, request.date_to, "filter"
+    elif terms.date_from or terms.date_to:
+        date_from, date_to, date_source = terms.date_from, terms.date_to, "inferred"
+    else:
+        date_from, date_to, date_source = None, None, None
+    range_start, range_end = day_bounds(date_from, date_to, request.tz_offset_minutes)
+    if date_source:
+        print(f"[query] date range ({date_source}): {date_from}..{date_to} -> [{range_start}, {range_end})")
     query_embeddings = await embed_texts([search_query])
     query_embedding = query_embeddings[0]
     embed_time = (time.time() - t0) * 1000
@@ -147,12 +172,12 @@ async def _run_search_pipeline(
         top_k=top_k,
         similarity_threshold=config.retrieval.similarity_threshold,
         sender=request.sender,
-        date_from=request.date_from,
-        date_to=request.date_to,
+        date_from=range_start,
+        date_before=range_end,
         folder=request.folder,
         has_attachments=request.has_attachments,
         accounts=request.accounts,
-        keywords=keywords,
+        keywords=terms.keywords,
         previous_source_ids=request.previous_source_ids,
     )
 
@@ -163,7 +188,9 @@ async def _run_search_pipeline(
         for msg in candidates[:10]:
             if msg.get("thread_id") and msg["thread_id"] not in seen_thread_ids:
                 seen_thread_ids.add(msg["thread_id"])
-                thread_msgs = await get_thread_context(session, msg["thread_id"])
+                thread_msgs = await get_thread_context(
+                    session, msg["thread_id"], date_from=range_start, date_before=range_end,
+                )
                 for tm in thread_msgs:
                     if tm["message_id"] not in seen_ids:
                         seen_ids.add(tm["message_id"])
@@ -200,6 +227,11 @@ async def _run_search_pipeline(
         "retrieval_time": retrieval_time,
         "char_budget": char_budget,
         "search_query": search_query,
+        "date_range": {
+            "from": date_from.isoformat() if date_from else None,
+            "to": date_to.isoformat() if date_to else None,
+            "source": date_source,
+        } if date_source else None,
     }
 
 
@@ -233,6 +265,8 @@ async def query_email(
 
             if pipeline["search_query"] != request.question:
                 yield f"data: {json.dumps({'type': 'rewritten_query', 'query': pipeline['search_query']})}\n\n"
+            if pipeline["date_range"]:
+                yield f"data: {json.dumps({'type': 'date_range', **pipeline['date_range']})}\n\n"
             yield f"data: {json.dumps({'type': 'sources', 'sources': sources})}\n\n"
             yield f"data: {json.dumps({'type': 'meta', 'embed_time_ms': embed_time, 'retrieval_time_ms': retrieval_time, 'context_messages': len(results), 'context_budget_tokens': char_budget // CHARS_PER_TOKEN})}\n\n"
 

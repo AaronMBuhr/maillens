@@ -229,3 +229,29 @@ async def test_result_dict_shape_and_body_fallback():
     }
     assert r["body_clean"] == "raw body"
     assert r["date"] == "2024-01-01T00:00:00"
+
+
+# --- get_thread_context date range --------------------------------------------
+
+def _where_sql(stmt) -> str:
+    from sqlalchemy.dialects import postgresql
+    return str(stmt.compile(dialect=postgresql.dialect()))
+
+
+async def test_thread_context_applies_date_range_in_sql():
+    from datetime import datetime, timezone
+    start = datetime(2024, 3, 15, tzinfo=timezone.utc)
+    end = datetime(2024, 3, 16, tzinfo=timezone.utc)
+    session = FakeSession([])
+    await queries.get_thread_context(session, 7, date_from=start, date_before=end)
+    sql = _where_sql(session.statements[0])
+    assert "messages.date >=" in sql
+    assert "messages.date <" in sql
+    # The range must come before LIMIT, so the limit counts in-range rows only.
+    assert sql.index("messages.date <") < sql.index("LIMIT")
+
+
+async def test_thread_context_without_range_has_no_date_filter():
+    session = FakeSession([])
+    await queries.get_thread_context(session, 7)
+    assert "messages.date >=" not in _where_sql(session.statements[0])
